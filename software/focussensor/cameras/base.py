@@ -243,10 +243,31 @@ class CameraBase(ABC):
         fw, fh = self.full_shape
         return self.set_roi((fw - width) // 2, (fh - height) // 2, width, height)
 
+    def set_roi_full(self) -> Tuple[int, int, int, int]:
+        """Open the window back up to the whole sensor.
+
+        This is the state a camera starts in, and the one to return to when
+        looking for the spots: a narrow band is fast but shows nothing until
+        it is pointed at the right part of the sensor.
+        """
+        fw, fh = self.full_shape
+        return self.set_roi(0, 0, fw, fh)
+
     def _apply_roi(self, roi: Tuple[int, int, int, int]) -> None:
         """Backend hook."""
 
     # ------------------------------------------------------------ bulk get/set
+    def hardware_params(self) -> Dict[str, Any]:
+        """What the sensor reports it is actually doing.
+
+        Requested and achieved are not the same thing: libcamera silently
+        clamps exposure to fit the frame duration, and gain to the sensor's
+        real steps. On a measuring instrument that difference matters, so it
+        is reported rather than hidden. Backends that cannot read anything
+        back return an empty dict.
+        """
+        return {}
+
     def get_params(self) -> Dict[str, Any]:
         x, y, w, h = self._roi
         return {
@@ -262,6 +283,8 @@ class CameraBase(ABC):
             "model": self.model,
             "simulated": self.simulated,
             "running": self._running,
+            "is_full_frame": self._roi == (0, 0, self.full_shape[0], self.full_shape[1]),
+            "actual": self.hardware_params(),
         }
 
     def set_params(self, **kwargs) -> Dict[str, Any]:
@@ -272,12 +295,14 @@ class CameraBase(ABC):
         """
         if "binning" in kwargs and kwargs["binning"] is not None:
             self.binning = kwargs["binning"]
-        roi = kwargs.get("roi")
-        if roi:
-            if isinstance(roi, dict):
+        if "roi" in kwargs:
+            roi = kwargs["roi"]
+            if roi is None or (isinstance(roi, str) and roi.lower() == "full"):
+                self.set_roi_full()
+            elif isinstance(roi, dict):
                 self.set_roi(roi.get("x", self._roi[0]), roi.get("y", self._roi[1]),
                              roi.get("width", self._roi[2]), roi.get("height", self._roi[3]))
-            else:
+            elif roi:
                 self.set_roi(*roi)
         for key in ("exposure_us", "gain", "fps_target"):
             if kwargs.get(key) is not None:

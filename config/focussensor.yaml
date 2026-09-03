@@ -23,9 +23,12 @@ camera:
     gain: 1.0
     binning: 1
     fps_target: 100.0
-    # Window on the sensor, in full-sensor pixels. Keep it a narrow band around
-    # the two spots: this is what makes the sensor fast, not the maths.
-    roi: {x: 408, y: 444, width: 640, height: 200}
+    # Window on the sensor, in full-sensor pixels. `null` means the whole
+    # sensor, which is what a fresh install needs: you cannot pick a band until
+    # you can see where the spots land. Once you can, narrow it -- a small
+    # window is what makes the sensor fast, not the maths -- and the value is
+    # written back here automatically.
+    roi: null
 
   # Only used by the simulated backend.
   simulation:
@@ -65,3 +68,13 @@ stream:
   history_length: 2000
   mjpeg_fps: 10.0
   jpeg_quality: 80
+  # The preview is for looking at, never for measuring: it is always scaled
+  # down to at most this width. Full-frame JPEGs off a Pi Zero cost far more
+  # than the acquisition loop they would be stealing time from.
+  preview_max_width: 800
+
+# Camera and estimator changes made over the API are written back to this file
+# a few seconds after the last change, so a tuned sensor comes back the same
+# way after a power cycle. Set false to make this file read-only in practice.
+persist_params: true
+persist_delay_s: 3.0

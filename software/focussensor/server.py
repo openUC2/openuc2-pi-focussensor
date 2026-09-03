@@ -30,7 +30,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDis
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from . import overlay
-from .config import save_config
+from .config import ParamStore, save_config
 from .engine import FocusEngine
 from .focus import FocusParams
 
@@ -41,11 +41,31 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
     """Build the ASGI app. ``engine`` is injectable so tests can supply one."""
 
     stream_cfg = config.get("stream", {})
+    preview_max_width = int(stream_cfg.get("preview_max_width", 800))
     engine = engine or FocusEngine(
         camera_config=config.get("camera", {}),
         focus_params=FocusParams(**config.get("focus", {})),
         history_length=int(stream_cfg.get("history_length", 2000)),
     )
+
+    def snapshot_params() -> Dict[str, Any]:
+        """The running settings, in the shape the config file stores them."""
+        camera_params = engine.camera.get_params()
+        camera = dict(config.get("camera") or {})
+        camera["startup"] = {
+            "exposure_us": camera_params["exposure_us"],
+            "gain": camera_params["gain"],
+            "binning": camera_params["binning"],
+            "fps_target": camera_params["fps_target"],
+            # null means the full sensor; storing it that way keeps the file
+            # portable between sensors of different sizes.
+            "roi": None if camera_params["is_full_frame"] else camera_params["roi"],
+        }
+        if getattr(engine.camera, "simulated", False):
+            camera["simulation"] = engine.camera.params.to_dict()
+        return {"camera": camera, "focus": engine.estimator.params.to_dict()}
+
+    store = ParamStore(config, snapshot_params)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -53,6 +73,9 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
         try:
             yield
         finally:
+            # Anything still inside the debounce window is written out here,
+            # so a clean shutdown never loses the last adjustment.
+            store.close()
             engine.close()
 
     app = FastAPI(
@@ -82,6 +105,12 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
         status["api_version"] = 1
         status["simulated"] = bool(getattr(engine.camera, "simulated", False))
         status["server_time"] = time.time()
+        status["persistence"] = {
+            "enabled": store.enabled,
+            "path": config.get("_path"),
+            "last_saved": store.last_saved_path,
+            "last_error": store.last_error,
+        }
         return status
 
     @app.get("/api/health", tags=["status"])
@@ -142,9 +171,11 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
         ``min_quality``.
         """
         try:
-            return engine.set_focus_params(**params)
+            updated = engine.set_focus_params(**params)
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        store.touch()
+        return updated
 
     @app.post("/api/focus/reset", tags=["focus"])
     def reset_focus() -> Dict[str, Any]:
@@ -165,13 +196,30 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
         """Set ``exposure_us``, ``gain``, ``binning``, ``fps_target`` and/or
         ``roi`` (``{x, y, width, height}`` in full-sensor pixels).
 
+        ``roi`` takes ``{x, y, width, height}`` in full-sensor pixels, or the
+        string ``"full"`` (or null) to open back up to the whole sensor.
+
         Values are clamped to what the backend accepts rather than rejected,
-        so a slider that runs past the hardware limit still works.
+        so a slider that runs past the hardware limit still works. Changes are
+        written back to the config file, so they survive a reboot.
         """
         try:
-            return engine.set_camera_params(**params)
+            updated = engine.set_camera_params(**params)
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        store.touch()
+        return updated
+
+    @app.post("/api/camera/roi/full", tags=["camera"])
+    def set_roi_full() -> Dict[str, Any]:
+        """Open the readout window back up to the whole sensor.
+
+        The shortcut you want when the spots are not where the narrow band is
+        pointed and you need to find them again.
+        """
+        params = engine.set_camera_params(roi="full")
+        store.touch()
+        return params
 
     @app.get("/api/camera/limits", tags=["camera"])
     def get_camera_limits() -> Dict[str, Any]:
@@ -183,14 +231,26 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
     def get_frame_jpeg(overlay_on: bool = Query(True, alias="overlay"),
                        stretch: bool = Query(True),
                        quality: int = Query(80, ge=1, le=100),
-                       scale: float = Query(1.0, gt=0.05, le=4.0)) -> Response:
-        """The current ROI as an annotated JPEG — the alignment view."""
+                       scale: float = Query(1.0, gt=0.05, le=4.0),
+                       max_width: int = Query(None, ge=32, le=4096)) -> Response:
+        """The current ROI as an annotated JPEG — the alignment view.
+
+        Always scaled down to ``stream.preview_max_width`` (pass ``max_width``
+        to override). The preview is for looking at; measurements come from
+        the focus endpoints, so there is nothing to gain from full-resolution
+        JPEGs and a Pi Zero has better things to do with the CPU.
+        """
         frame, projection, sample = engine.snapshot()
+        if frame is None:
+            # Give a starting camera a moment rather than failing a page load.
+            engine.wait_for_fresh_sample(timeout=2.0)
+            frame, projection, sample = engine.snapshot()
         if frame is None:
             raise HTTPException(status_code=503, detail="no frame yet")
         try:
             jpeg = overlay.render(frame, projection, sample, overlay=overlay_on,
-                                  stretch=stretch, quality=quality, scale=scale)
+                                  stretch=stretch, quality=quality, scale=scale,
+                                  max_width=max_width or preview_max_width)
         except RuntimeError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
         return Response(content=jpeg, media_type="image/jpeg",
@@ -207,6 +267,9 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
         """
         frame = engine.latest_frame
         if frame is None:
+            engine.wait_for_fresh_sample(timeout=2.0)
+            frame = engine.latest_frame
+        if frame is None:
             raise HTTPException(status_code=503, detail="no frame yet")
         buffer = io.BytesIO()
         np.save(buffer, frame, allow_pickle=False)
@@ -217,8 +280,12 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
     @app.get("/api/stream.mjpg", tags=["images"])
     def get_mjpeg(fps: float = Query(None, gt=0.1, le=30.0),
                   quality: int = Query(None, ge=1, le=100),
-                  scale: float = Query(1.0, gt=0.05, le=4.0)) -> StreamingResponse:
-        """Motion-JPEG of the annotated ROI, for a browser or ImSwitch."""
+                  scale: float = Query(1.0, gt=0.05, le=4.0),
+                  max_width: int = Query(None, ge=32, le=4096)) -> StreamingResponse:
+        """Motion-JPEG of the annotated ROI, for a browser or ImSwitch.
+
+        Downscaled to ``stream.preview_max_width`` like the single-frame view.
+        """
         target_fps = fps or float(stream_cfg.get("mjpeg_fps", 10.0))
         jpeg_quality = quality or int(stream_cfg.get("jpeg_quality", 80))
         boundary = "focusframe"
@@ -231,7 +298,8 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
                 if frame is not None:
                     try:
                         jpeg = overlay.render(frame, projection, sample,
-                                              quality=jpeg_quality, scale=scale)
+                                              quality=jpeg_quality, scale=scale,
+                                              max_width=max_width or preview_max_width)
                         yield (b"--" + boundary.encode() + b"\r\n"
                                b"Content-Type: image/jpeg\r\n"
                                b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
@@ -282,23 +350,19 @@ def create_app(config: Dict[str, Any], engine: Optional[FocusEngine] = None) -> 
     # ------------------------------------------------------------------ config
     @app.post("/api/params/save", tags=["config"])
     def save_params(path: Optional[str] = Body(None, embed=True)) -> Dict[str, Any]:
-        """Persist the *running* camera and estimator settings to the YAML file
-        so they survive a reboot."""
-        camera_params = engine.camera.get_params()
-        config.setdefault("camera", {}).setdefault("startup", {}).update({
-            "exposure_us": camera_params["exposure_us"],
-            "gain": camera_params["gain"],
-            "binning": camera_params["binning"],
-            "fps_target": camera_params["fps_target"],
-            "roi": camera_params["roi"],
-        })
-        config["focus"] = engine.estimator.params.to_dict()
-        if getattr(engine.camera, "simulated", False):
-            config.setdefault("camera", {})["simulation"] = engine.camera.params.to_dict()
+        """Write the running settings out now.
+
+        Changes are persisted automatically a few seconds after the last one;
+        this forces it immediately, or writes to a different ``path``.
+        """
+        config.update(snapshot_params())
         try:
-            written = save_config(config, path)
+            written = save_config(config, path) if path else store.flush()
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if written is None:
+            raise HTTPException(status_code=500,
+                                detail=store.last_error or "write failed")
         return {"ok": True, "path": written}
 
     # --------------------------------------------------------------- websocket

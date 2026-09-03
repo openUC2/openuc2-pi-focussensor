@@ -35,20 +35,26 @@ def render(frame: np.ndarray,
            projection: Optional[np.ndarray] = None,
            sample: Optional[Dict[str, Any]] = None,
            *, overlay: bool = True, stretch: bool = True,
-           quality: int = 80, scale: float = 1.0) -> bytes:
+           quality: int = 80, scale: float = 1.0,
+           max_width: Optional[int] = None) -> bytes:
     """Render one annotated JPEG. Returns the encoded bytes."""
     if not _HAVE_PIL:
         raise RuntimeError("Pillow is required for the debug image endpoints")
 
     data = _stretch(frame) if stretch else np.clip(frame, 0, 255).astype(np.uint8)
-    if data.ndim == 3:
-        image = Image.fromarray(data, mode="RGB").convert("RGB")
-    else:
-        image = Image.fromarray(data, mode="L").convert("RGB")
+    image = Image.fromarray(data).convert("RGB")
 
-    if scale and scale != 1.0:
-        image = image.resize((max(1, int(image.width * scale)),
-                              max(1, int(image.height * scale))), Image.NEAREST)
+    # Cap the width before annotating, so the labels stay legible instead of
+    # being shrunk with the image. A full-frame preview is never wanted: it is
+    # for looking at, and encoding one costs more than the estimator it would
+    # be stealing time from.
+    effective = float(scale or 1.0)
+    if max_width and image.width * effective > max_width:
+        effective = max_width / image.width
+    if effective != 1.0:
+        image = image.resize((max(1, int(image.width * effective)),
+                              max(1, int(image.height * effective))),
+                             Image.BILINEAR if effective < 1.0 else Image.NEAREST)
 
     if overlay:
         _annotate(image, projection, sample or {})

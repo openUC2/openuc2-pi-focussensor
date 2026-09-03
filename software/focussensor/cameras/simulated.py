@@ -93,6 +93,9 @@ class SimParams:
     background_counts: float = 6.0
     read_noise_counts: float = 2.0
     shot_noise: bool = True
+    exact_poisson: bool = False
+    """Sample true Poisson statistics instead of the Gaussian approximation.
+    Correct at very low signal, but several times slower over a full frame."""
     stray_light_gradient: float = 3.0
     """Counts of linear background ramp across x — the estimator's baseline
     removal has to cope with this."""
@@ -135,7 +138,8 @@ class SimulatedTwoSpotCamera(CameraBase):
         self._z_lock = threading.Lock()
         self._t0 = time.monotonic()
         self._next_frame_at = 0.0
-        self.center_roi(640, 200)
+        # Starts full-frame, like the real camera: the ROI is something you
+        # narrow down once you can see where the spots actually land.
 
     # ------------------------------------------------------------- simulation
     @property
@@ -222,11 +226,25 @@ class SimulatedTwoSpotCamera(CameraBase):
                 gx = np.exp(-0.5 * ((xs - x_c) / sigma_x) ** 2)
                 img += (amp * scale) * np.outer(gy, gx)
 
-        # Photon shot noise on the accumulated signal, then read noise.
-        if p.shot_noise:
-            img = self._rng.poisson(np.clip(img, 0, None)).astype(np.float32)
-        if p.read_noise_counts > 0:
-            img += self._rng.normal(0.0, p.read_noise_counts, img.shape).astype(np.float32)
+        # Shot noise plus read noise. Poisson and Gaussian noise add in
+        # variance, so both come from a single normal draw with
+        # sigma = sqrt(signal + read^2) -- about four times cheaper than
+        # sampling Poisson over a full 1.6 Mpx frame, and indistinguishable
+        # above a handful of counts. Set `exact_poisson` when the discreteness
+        # at very low signal actually matters.
+        if p.exact_poisson:
+            if p.shot_noise:
+                img = self._rng.poisson(np.clip(img, 0, None)).astype(np.float32)
+            if p.read_noise_counts > 0:
+                img += self._rng.normal(0.0, p.read_noise_counts,
+                                        img.shape).astype(np.float32)
+        else:
+            variance = np.clip(img, 0, None) if p.shot_noise else np.zeros_like(img)
+            if p.read_noise_counts > 0:
+                variance = variance + p.read_noise_counts ** 2
+            if variance.any():
+                img = img + np.sqrt(variance) * self._rng.standard_normal(
+                    img.shape, dtype=np.float32)
         if p.hot_pixel_fraction > 0:
             n_hot = int(p.hot_pixel_fraction * img.size)
             if n_hot:

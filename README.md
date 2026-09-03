@@ -17,7 +17,7 @@ number.
                     │ Pi Zero 2 W                    │
                     │  camera ─► ROI ─► peak fit     │   ~1 ms/frame
                     └─────┬──────────────────────────┘
-                          │  one USB cable: power + CDC-NCM ethernet
+                          │  network (WiFi or ethernet), REST + WebSocket
                     ┌─────▼──────────────────────────┐
                     │ ImSwitch host                  │
                     │  RemoteFocusSensorManager       │
@@ -91,27 +91,33 @@ rate 88.19 Hz, 0.834 ms/frame, 19 frames, 0 errors
 A sensitivity near zero there means the spots are outside the ROI, which is by
 far the most common way to get a sensor that runs happily and measures nothing.
 
-## Why USB ethernet and not UVC
+## Transport
 
-A composite USB gadget can absolutely carry UVC video *and* a data channel on
-one cable — `f_uvc` alongside `f_ncm` in configfs is a normal thing to build.
-It is still the wrong choice here:
+The sensor is reached over the Pi's **normal network** — WiFi on a Zero 2 W, or
+ethernet — as plain HTTP and a WebSocket. Nothing about the design depends on
+that: it is a TCP service, and moving it onto a USB link later changes only
+which interface it answers on.
 
-* The sensor's real output is one number, not video. UVC gets you a video
-  stream that ImSwitch does not consume, and the debug image HTTP already
-  serves for free.
-* `uvc-gadget` on a Pi is the most fragile part of that stack. CDC-NCM is a
-  stock kernel function with no userspace daemon to wedge.
-* NCM works driverless on Linux and macOS and with the in-box driver on
-  Windows 10+, and carries REST, the WebSocket and the MJPEG debug view over
-  one interface.
+USB gadget mode was built and then removed; if it comes back, the notes are:
 
-CAN was the other candidate. It suits the *payload* fine (a float32 plus status
-is five bytes), but it carries no image, so alignment would need a second
-channel anyway; the Pi has no CAN controller without extra hardware; and adding
-a fast focus stream to the bus that already carries motion commands is how you
-make stage moves jittery. CAN earns its place in a later step — see
-[Where the loop lives](#where-the-loop-lives).
+* **CDC-NCM, not UVC.** A composite gadget can carry UVC video *and* a data
+  channel on one cable — `f_uvc` alongside `f_ncm` in configfs is a normal
+  thing to build. But the sensor's output is one number, not video: UVC gets
+  you a stream ImSwitch does not consume, plus `uvc-gadget`, which is the most
+  fragile part of that stack. NCM is a stock kernel function with no userspace
+  daemon to wedge, works driverless on Linux and macOS and with the in-box
+  driver on Windows 10+, and carries REST, the WebSocket and the MJPEG view
+  over one interface.
+* **Not CAN either.** It suits the *payload* fine (a float32 plus status is
+  five bytes), but it carries no image, so alignment would need a second
+  channel anyway; the Pi has no CAN controller without extra hardware; and
+  adding a fast focus stream to the bus that already carries motion commands
+  is how you make stage moves jittery. CAN earns its place in a later step —
+  see [Where the loop lives](#where-the-loop-lives).
+* Gadget mode needs `dtoverlay=dwc2` plus `modules-load=dwc2`, and the cable
+  must go into the port marked **USB**, not **PWR IN**. Note that `dtoverlay=dwc2`
+  also stops that port working as a USB *host*, so the installer actively
+  removes it rather than leaving it behind.
 
 ## Wire protocol
 
@@ -145,12 +151,13 @@ sample from 20 ms ago is worthless.
 | `GET`/`POST /api/focus/params` | estimator parameters |
 | `POST /api/focus/reset` | forget the running separation history |
 | `GET`/`POST /api/camera/params` | exposure, gain, binning, fps, ROI |
+| `POST /api/camera/roi/full` | reopen the readout window to the whole sensor |
 | `GET /api/camera/limits` | what the backend will actually accept |
-| `GET /api/frame.jpg` | annotated ROI — the alignment view |
+| `GET /api/frame.jpg` | annotated ROI, downscaled — the alignment view |
 | `GET /api/frame.npy` | raw ROI frame, what ImSwitch reads |
 | `GET /api/stream.mjpg` | Motion-JPEG of the annotated ROI |
 | `GET`/`POST /api/sim/state` | drive the simulated stage and optical model |
-| `POST /api/params/save` | persist running settings to the YAML |
+| `POST /api/params/save` | force an immediate write (it is automatic otherwise) |
 
 Interactive docs at `http://<sensor>:8321/docs`.
 
@@ -194,19 +201,66 @@ Two behaviours are worth knowing about:
   exposed *after* that move, in one round trip. That is what makes an
   end-to-end simulated focus lock — including a calibration sweep — possible.
 
+## The camera
+
+`backend: auto` (the default) uses the real Pi camera whenever picamera2
+imports and the simulator otherwise, so the same image boots on a bare Pi and
+on one with optics attached. `picamera2` forces the real camera and fails
+loudly rather than quietly serving synthetic pixels — on hardware a silent
+fallback would let a focus lock run against a simulation.
+
+Three things make this a *measuring* camera rather than a picture camera:
+
+* **Everything automatic is off.** AE, AWB, denoise, sharpening and the tone
+  curve are disabled and pinned neutral. An auto-exposure loop hunting between
+  frames shows up directly as focus noise, and a denoiser moves the spot
+  centroid. Exposure and gain do exactly what you set.
+* **The output is grayscale.** A mono sensor is read as `R8`; a colour sensor
+  falls back to `YUV420` and only the luma plane is used — the cheapest thing
+  the ISP can hand over. White balance is therefore irrelevant, and is fixed at
+  unity only so the debug JPEG has no colour cast.
+* **Requested is not achieved.** libcamera silently clamps exposure to fit the
+  frame duration and gain to the sensor's real steps. `/api/status` reports
+  what the sensor says it actually did under `camera.actual`, including an
+  `exposure_clamped` flag, instead of hiding the difference.
+
+The camera **starts on the full sensor**, and `POST /api/camera/roi/full`
+always gets you back there. A narrow ROI is what makes the sensor fast, but you
+cannot choose one until you can see where the spots land, so narrowing is a
+deliberate step rather than a default you have to discover. Once narrowed, set
+a band like 640×200: the ISP then delivers those pixels at a high rate.
+Grabbing full frames and cropping in numpy is what would make a Pi struggle;
+the arithmetic never was the problem.
+
+### Parameters persist
+
+Exposure, gain, ROI, binning, frame rate and every estimator threshold are
+written back to the config file a few seconds after the last change, so a
+sensor tuned over the API comes back the same way after a power cycle. Writes
+are debounced (dragging a slider is one write, not fifty) and atomic. Set
+`persist_params: false` to make the file read-only in practice, or
+`POST /api/params/save` to force a write immediately.
+
+A full-sensor ROI is stored as `null` rather than as pixel dimensions, so a
+saved config stays portable between sensors of different sizes.
+
+### Previews are always downscaled
+
+`/api/frame.jpg` and `/api/stream.mjpg` are capped at
+`stream.preview_max_width` (800 px by default; `?max_width=` overrides). The
+preview is for looking at — measurements come from the focus endpoints — so
+there is nothing to gain from a full-resolution JPEG and a Pi Zero has better
+uses for the CPU. `/api/frame.npy`, which is what ImSwitch and the estimator
+see, is never scaled.
+
 ## Hardware
 
 * **Raspberry Pi Zero 2 W**, not the original Zero. libcamera plus a per-frame
   estimator on a single ARMv6 core is not a good time; the quad A53 has
   headroom to spare.
 * **Global shutter (IMX296)** if there is vibration or the spot moves during
-  the exposure. IMX219 is fine and cheaper otherwise.
-* One USB cable into the Pi's **OTG** port carries both power and the link.
-
-The single most important setting is the **ROI**. Configure a narrow band
-around the two spots (e.g. 640×200) so the sensor delivers those pixels
-directly at a high frame rate. Grabbing full frames and cropping in numpy is
-what would make a Pi struggle; the arithmetic never was the problem.
+  the exposure. IMX219 is fine and cheaper otherwise. A mono sensor is worth
+  it: no Bayer filter means every pixel sees the laser.
 
 ## Installing on a Pi
 
@@ -222,9 +276,19 @@ It stages the source in `/opt/focussensor/src` and `pip install`s it into a
 venv built with `--system-site-packages`, so numpy, Pillow and picamera2 come
 from apt (building those with pip on a Pi is slow at best) while the service's
 own dependencies come from `pyproject.toml`. It then enables
-`focussensor.service`, brings up the CDC-NCM USB gadget with a static
-`192.168.7.2` on `usb0`, and sets the hostname to `focussensor.local` so the
-host can reach it by name without configuring an address of its own.
+`focussensor.service`, sets the hostname to `focussensor.local` so the
+microscope host can find it without anyone configuring an IP, and disables the
+Bookworm first-boot user wizard — which otherwise takes over the HDMI console
+asking for a username and leaves a headless sensor never finishing its boot.
+
+Set up **WiFi and a user account in Raspberry Pi Imager** when flashing (the
+gear icon), or the Pi will have no network and no way in. Bookworm ships with
+no default `pi` account at all — that is what the first-boot wizard is asking
+about — so this is not optional.
+
+Unlike the SolarScope station, the sensor does **not** run its own WiFi access
+point. It is a satellite of a microscope host, so it needs to be *on* that
+host's network; an access point would force the host to leave its own.
 
 Config lives at `/boot/firmware/focussensor.yaml`, editable with the card in a
 laptop.
@@ -316,18 +380,20 @@ software/focussensor/       the service
   overlay.py                annotated debug JPEG
   client.py                 standalone client: status, set, watch, sweep, snap
 tools/focussensor_client.py runs client.py out of a checkout, uninstalled
-config/focussensor.yaml     shipped defaults
-sd-image/                   installer and USB gadget setup
+config/focussensor.yaml     shipped defaults, and where runtime changes persist
+sd-image/                   the Pi installer
 tests/                      hardware-free test suite
 ```
 
 ## Status
 
 The simulated path is tested end to end, including through ImSwitch's focus
-lock. **The Picamera2 backend has not yet been run on hardware** — it is
-written against the same interface and follows libcamera's rules for a
-metrology sensor (all auto algorithms off, `ScalerCrop` for the ROI, luma plane
-only, frame duration pinned), but treat its first run as bring-up.
+lock. **The Picamera2 backend has not been run on real optics yet.** Everything
+around the sensor *is* tested — against a stand-in picamera2 that behaves like
+the real one: mono/colour detection, the `R8` → `YUV420` fallback, control
+filtering against what the pipeline advertises, `ScalerCrop` clamping, exposure
+clamped to the frame period, and the metadata read-back. What remains unproven
+is the sensor itself, so treat the first run on optics as bring-up.
 
 ## Licence
 

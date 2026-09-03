@@ -13,6 +13,7 @@ then persist them so they survive a reboot.
 import copy
 import logging
 import os
+import threading
 from typing import Any, Dict, Optional
 
 log = logging.getLogger("focussensor.config")
@@ -34,12 +35,14 @@ DEFAULTS: Dict[str, Any] = {
         # "auto" = real Pi camera when picamera2 imports, simulator otherwise.
         "backend": "auto",
         "camera_num": 0,
+        # null ROI = the whole sensor. A fresh sensor has to show everything
+        # before anyone can decide which narrow band the spots live in.
         "startup": {
             "exposure_us": 5000,
             "gain": 1.0,
             "binning": 1,
             "fps_target": 100.0,
-            "roi": {"x": 408, "y": 444, "width": 640, "height": 200},
+            "roi": None,
         },
         "simulation": {
             "sensitivity_px_per_um": 3.0,
@@ -63,7 +66,12 @@ DEFAULTS: Dict[str, Any] = {
         "history_length": 2000,
         "mjpeg_fps": 10.0,
         "jpeg_quality": 80,
+        "preview_max_width": 800,
     },
+    # Write camera and estimator changes back to this file so a tuned sensor
+    # comes back the same way after a power cycle.
+    "persist_params": True,
+    "persist_delay_s": 3.0,
 }
 
 
@@ -126,3 +134,80 @@ def save_config(config: Dict[str, Any], path: Optional[str] = None) -> str:
     os.replace(tmp, target)     # atomic: never leave a half-written config
     log.info("saved config to %s", target)
     return target
+
+
+class ParamStore:
+    """Writes runtime parameter changes back to the config file.
+
+    A sensor is tuned by moving sliders, not by editing YAML: exposure, gain,
+    the ROI and the estimator thresholds all get adjusted over the API while
+    watching the live view. Those values are what the sensor should come back
+    with after a power cycle, so they are written back to the same file the
+    defaults came from -- one file, no precedence puzzle between "the config"
+    and "the saved state".
+
+    Writes are debounced: dragging a slider produces a burst of changes and a
+    boot partition is FAT on an SD card, so the file is rewritten once a few
+    seconds after the last change rather than on every one. ``save_config``
+    replaces atomically, so an interrupted write cannot leave a half-file.
+    """
+
+    def __init__(self, config: Dict[str, Any], snapshot, delay_s: Optional[float] = None,
+                 enabled: Optional[bool] = None):
+        self._config = config
+        self._snapshot = snapshot          # callable -> dict merged into config
+        self._delay = float(config.get("persist_delay_s", 3.0)
+                            if delay_s is None else delay_s)
+        self._enabled = bool(config.get("persist_params", True)
+                             if enabled is None else enabled)
+        self._timer: Optional[threading.Timer] = None
+        self._lock = threading.Lock()
+        self.last_saved_path: Optional[str] = None
+        self.last_error: Optional[str] = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def touch(self) -> None:
+        """Note that something changed; write it out once things settle."""
+        if not self._enabled:
+            return
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._delay, self._write)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def flush(self) -> Optional[str]:
+        """Write now, cancelling any pending debounce. Returns the path."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+        return self._write()
+
+    def close(self) -> None:
+        """Persist anything still pending, then stop."""
+        with self._lock:
+            pending = self._timer is not None
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+        if pending and self._enabled:
+            self._write()
+
+    def _write(self) -> Optional[str]:
+        try:
+            self._config.update(self._snapshot())
+            self.last_saved_path = save_config(self._config)
+            self.last_error = None
+            log.debug("persisted parameters to %s", self.last_saved_path)
+            return self.last_saved_path
+        except Exception as exc:                       # noqa: BLE001
+            # Losing a settings write must never take the sensor down with it:
+            # a read-only boot partition is annoying, not fatal.
+            self.last_error = str(exc)
+            log.warning("could not persist parameters: %s", exc)
+            return None
