@@ -1,0 +1,12 @@
+# Copy this file to the boot partition as `wifi.txt` and fill it in.
+# It is read on every boot, so the sensor can be moved to another network by
+# putting the card in any laptop and editing this one file.
+#
+# The boot partition is FAT: Windows, macOS and Linux all mount it.
+
+ssid=YourNetwork
+password=YourPassword
+
+# Two-letter regulatory domain. Without it the radio may not even scan the
+# channels your access point is using.
+country=DE

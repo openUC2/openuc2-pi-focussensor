@@ -17,6 +17,7 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 APP_DIR=/opt/focussensor
 BOOT_DIR=/boot/firmware
 HOSTNAME_NEW=focussensor
+USB0_ADDR=192.168.7.2
 export DEBIAN_FRONTEND=noninteractive
 
 [ "$(id -u)" -eq 0 ] || { echo "run me with sudo"; exit 1; }
@@ -30,7 +31,7 @@ apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip \
     python3-numpy python3-pil python3-yaml \
     python3-picamera2 \
-    avahi-daemon iproute2 fake-hwclock curl
+    avahi-daemon iproute2 fake-hwclock curl dnsmasq
 
 echo "==> Staging the source in $APP_DIR/src"
 mkdir -p "$APP_DIR"
@@ -61,31 +62,81 @@ append_once() {  # append_once <file> <line>
 }
 CONFIG_TXT="$BOOT_DIR/config.txt"
 append_once "$CONFIG_TXT" "# --- openUC2 focus sensor ---"
+append_once "$CONFIG_TXT" "dtoverlay=dwc2,dr_mode=peripheral"
 append_once "$CONFIG_TXT" "camera_auto_detect=1"
 append_once "$CONFIG_TXT" "dtoverlay=disable-bt"  # nothing here needs bluetooth
 append_once "$CONFIG_TXT" "disable_splash=1"
 append_once "$CONFIG_TXT" "boot_delay=0"
 
-echo "==> Removing any USB gadget wiring from earlier installs"
-# The sensor is reached over the Pi's normal network (WiFi or ethernet). An
-# earlier version of this script set the OTG port up as a USB ethernet gadget;
-# leaving that behind is not harmless -- dwc2 in peripheral mode stops the OTG
-# port working as a host too, and enabling systemd-networkd alongside
-# NetworkManager on Bookworm invites the two to fight over interfaces.
+echo "==> USB ethernet gadget (one cable: power, data, and the sensor)"
+# The kernel needs dwc2 in peripheral mode before userspace, and modules-load
+# in cmdline.txt is the only reliable way to get that on a Pi. Note that this
+# also stops the OTG port working as a USB *host* -- it is one or the other.
 CMDLINE="$BOOT_DIR/cmdline.txt"
-if [ -f "$CMDLINE" ]; then
-    sed -i 's/ *modules-load=dwc2[^ ]*//g' "$CMDLINE"
+if [ -f "$CMDLINE" ] && ! grep -q "modules-load=dwc2" "$CMDLINE"; then
+    sed -i '1 s|$| modules-load=dwc2|' "$CMDLINE"
 fi
-sed -i '/^dtoverlay=dwc2$/d' "$CONFIG_TXT" 2>/dev/null || true
-rm -f /etc/systemd/network/10-focussensor-usb0.network \
-      /etc/NetworkManager/conf.d/99-focussensor-unmanaged-usb0.conf \
-      /usr/local/sbin/focussensor-usb-gadget \
-      /etc/systemd/system/focussensor-usb-gadget.service
-systemctl disable focussensor-usb-gadget.service 2>/dev/null || true
+install -m 0755 "$SCRIPT_DIR/usb-gadget.sh" /usr/local/sbin/focussensor-usb-gadget
+if [ ! -f "$BOOT_DIR/usb-gadget.txt" ]; then
+    cp "$REPO_ROOT/config/usb-gadget.txt.example" "$BOOT_DIR/usb-gadget.txt.example"
+fi
+
+# NetworkManager owns every other interface; usb0 belongs to the gadget script,
+# which sets the address itself. Two managers on one interface is a reliable
+# way to have it configured and then unconfigured a second later.
+install -d /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/99-focussensor-unmanaged-usb0.conf <<'NMCONF'
+[keyfile]
+unmanaged-devices=interface-name:usb0
+NMCONF
+
+# Hand the host an address over the link. Without this the host self-assigns a
+# 169.254 link-local address, the Pi sits on 192.168.7.2, and the two cannot
+# see each other -- the classic "the interface appeared but nothing answers".
+cat > /etc/dnsmasq.d/focussensor-usb0.conf <<DNSMASQ
+# DHCP for the USB link only. Scoped hard: this must never answer on any other
+# interface, and must not hand out a default route or a DNS server, or the
+# host would try to reach the internet through a Raspberry Pi Zero.
+interface=usb0
+# bind-dynamic, not bind-interfaces: usb0 only exists once the gadget binds,
+# and dnsmasq would otherwise refuse to start when it is not there yet.
+bind-dynamic
+except-interface=lo
+port=0
+dhcp-authoritative
+dhcp-range=192.168.7.10,192.168.7.20,255.255.255.0,12h
+dhcp-option=3
+dhcp-option=6
+DNSMASQ
+systemctl enable dnsmasq 2>/dev/null || true
+
+echo "==> WiFi from the boot partition"
+# A headless sensor needs a way onto the network that does not require being
+# on the network already. This reads wifi.txt from the boot partition at every
+# boot, so the card can be reconfigured from any laptop.
+install -m 0755 "$SCRIPT_DIR/wifi-from-boot.sh" /usr/local/sbin/focussensor-wifi
+if [ ! -f "$BOOT_DIR/wifi.txt" ]; then
+    cp "$REPO_ROOT/config/wifi.txt.example" "$BOOT_DIR/wifi.txt.example"
+fi
 
 echo "==> systemd services"
 cp "$REPO_ROOT/software/systemd/focussensor.service"            /etc/systemd/system/
+cp "$REPO_ROOT/software/systemd/focussensor-wifi.service"       /etc/systemd/system/
+cp "$REPO_ROOT/software/systemd/focussensor-usb-gadget.service" /etc/systemd/system/
 systemctl daemon-reload 2>/dev/null || true
+# Installing a unit does not start it at boot -- this enable is the whole
+# reason the service runs at all, and its absence is invisible until the Pi
+# comes up with nothing listening on 8321.
+systemctl enable focussensor.service focussensor-usb-gadget.service \
+                 focussensor-wifi.service
+
+# Nothing here needs to wait for the network before the rest of userspace
+# starts, and with no network configured this unit blocks the boot for its
+# full timeout -- which looks exactly like a hang on the HDMI console.
+systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+systemctl mask    NetworkManager-wait-online.service 2>/dev/null || true
+systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
+systemctl mask    systemd-networkd-wait-online.service 2>/dev/null || true
 
 echo "==> Hostname / mDNS: ${HOSTNAME_NEW}.local"
 # mDNS is how the microscope host finds the sensor without anyone having to
@@ -158,6 +209,8 @@ else
   echo "  Camera:   $(echo "$STATUS" | sed -n 's/.*"model": *"\([^"]*\)".*/\1/p' | head -1)"
 fi
 echo "  Config:   /boot/firmware/focussensor.yaml"
+echo "  USB link: /boot/firmware/usb-gadget.txt   (mode=ecm|ncm|rndis)"
+echo "  WiFi:     /boot/firmware/wifi.txt          (optional: ssid=/password=)"
 echo "  Logs:     journalctl -u focussensor -f"
 echo "  Check:    /opt/focussensor/venv/bin/focussensor-client status"
 BANNER
@@ -167,4 +220,5 @@ if [ -d /home/pi ] && ! grep -q focussensor-info /home/pi/.bashrc 2>/dev/null; t
         >> /home/pi/.bashrc
 fi
 
-echo "==> Done. Reboot, then reach the sensor at http://focussensor.local:8321/"
+echo "==> Done. Reboot, plug the host into the port marked USB (not PWR IN),"
+echo "    and browse to http://192.168.7.2:8321/ or http://focussensor.local:8321/"

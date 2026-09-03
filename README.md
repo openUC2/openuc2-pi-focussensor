@@ -17,7 +17,7 @@ number.
                     │ Pi Zero 2 W                    │
                     │  camera ─► ROI ─► peak fit     │   ~1 ms/frame
                     └─────┬──────────────────────────┘
-                          │  network (WiFi or ethernet), REST + WebSocket
+                          │  one USB cable: power + CDC-ECM ethernet
                     ┌─────▼──────────────────────────┐
                     │ ImSwitch host                  │
                     │  RemoteFocusSensorManager       │
@@ -93,31 +93,48 @@ far the most common way to get a sensor that runs happily and measures nothing.
 
 ## Transport
 
-The sensor is reached over the Pi's **normal network** — WiFi on a Zero 2 W, or
-ethernet — as plain HTTP and a WebSocket. Nothing about the design depends on
-that: it is a TCP service, and moving it onto a USB link later changes only
-which interface it answers on.
+One USB cable into the Pi's **OTG** port carries power and the link. The Pi
+presents itself as a USB ethernet device, and the sensor answers at
+**http://192.168.7.2:8321/** (or `http://focussensor.local:8321/`).
 
-USB gadget mode was built and then removed; if it comes back, the notes are:
+Three things make that work without any setup on the host:
 
-* **CDC-NCM, not UVC.** A composite gadget can carry UVC video *and* a data
-  channel on one cable — `f_uvc` alongside `f_ncm` in configfs is a normal
-  thing to build. But the sensor's output is one number, not video: UVC gets
-  you a stream ImSwitch does not consume, plus `uvc-gadget`, which is the most
-  fragile part of that stack. NCM is a stock kernel function with no userspace
-  daemon to wedge, works driverless on Linux and macOS and with the in-box
-  driver on Windows 10+, and carries REST, the WebSocket and the MJPEG view
-  over one interface.
-* **Not CAN either.** It suits the *payload* fine (a float32 plus status is
-  five bytes), but it carries no image, so alignment would need a second
-  channel anyway; the Pi has no CAN controller without extra hardware; and
-  adding a fast focus stream to the bus that already carries motion commands
-  is how you make stage moves jittery. CAN earns its place in a later step —
-  see [Where the loop lives](#where-the-loop-lives).
-* Gadget mode needs `dtoverlay=dwc2` plus `modules-load=dwc2`, and the cable
-  must go into the port marked **USB**, not **PWR IN**. Note that `dtoverlay=dwc2`
-  also stops that port working as a USB *host*, so the installer actively
-  removes it rather than leaving it behind.
+* **CDC-ECM by default, not NCM.** NCM is newer and faster, but macOS only
+  gained native support in Ventura while ECM has worked on macOS and Linux for
+  a decade. The link carries a few kB/s of JSON and the occasional JPEG, so
+  ECM's lower throughput is irrelevant and its compatibility is not. Override
+  in `/boot/firmware/usb-gadget.txt` with `mode=ncm` or `mode=rndis`
+  (Windows).
+* **The MAC addresses come from the Pi's serial**, so they are identical on
+  every boot. With random MACs the host invents a new interface each time —
+  `en5`, `en6`, `en7` on a Mac — and any address configuration has to be redone.
+* **The Pi runs DHCP on that link only.** Without it the host self-assigns a
+  169.254 address, the Pi sits on 192.168.7.2, and the two cannot see each
+  other — the classic "the interface appeared but nothing answers". dnsmasq is
+  scoped to `usb0` and deliberately hands out **no default route and no DNS**,
+  so the host keeps its own internet.
+
+The cable must go into the port marked **USB**, not **PWR IN** — only the
+middle one is OTG. Note that `dtoverlay=dwc2` also stops that port working as
+a USB *host*; it is one or the other.
+
+**Not UVC.** A composite gadget can carry UVC video *and* a data channel —
+`f_uvc` alongside `f_ecm` in configfs is a normal thing to build. But the
+sensor's output is one number, not video: UVC gets you a stream ImSwitch does
+not consume, plus `uvc-gadget`, the most fragile part of that stack. The debug
+image is already served over HTTP on the same link.
+
+**Not CAN.** It suits the *payload* fine (a float32 plus status is five bytes),
+but it carries no image, so alignment would need a second channel anyway; the
+Pi has no CAN controller without extra hardware; and adding a fast focus stream
+to the bus that already carries motion commands is how you make stage moves
+jittery. CAN earns its place in a later step — see
+[Where the loop lives](#where-the-loop-lives).
+
+**WiFi is optional.** If `/boot/firmware/wifi.txt` exists (`ssid=` /
+`password=` / `country=`, or one line `SSID:password`), it is applied at every
+boot. Useful when the sensor sits away from the host; not needed for the USB
+link.
 
 ## Wire protocol
 
@@ -281,14 +298,18 @@ microscope host can find it without anyone configuring an IP, and disables the
 Bookworm first-boot user wizard — which otherwise takes over the HDMI console
 asking for a username and leaves a headless sensor never finishing its boot.
 
-Set up **WiFi and a user account in Raspberry Pi Imager** when flashing (the
-gear icon), or the Pi will have no network and no way in. Bookworm ships with
-no default `pi` account at all — that is what the first-boot wizard is asking
-about — so this is not optional.
+Bookworm ships with **no default `pi` account** — that is what the first-boot
+wizard on the HDMI console is asking about, and it will strand a headless
+sensor. The SD image creates `pi` / `youseetoo` and masks the wizard; if you
+install onto a stock image by hand, create a user first (or set one in
+Raspberry Pi Imager) and re-run the installer.
 
-Unlike the SolarScope station, the sensor does **not** run its own WiFi access
-point. It is a satellite of a microscope host, so it needs to be *on* that
-host's network; an access point would force the host to leave its own.
+Both wait-online units are masked as well. With no network configured they
+block the boot for their full timeout, which on a console looks exactly like a
+hang partway through systemd's output.
+
+Unlike the SolarScope station, the sensor does **not** run a WiFi access point:
+it is reached over the USB cable.
 
 Config lives at `/boot/firmware/focussensor.yaml`, editable with the card in a
 laptop.
@@ -381,7 +402,9 @@ software/focussensor/       the service
   client.py                 standalone client: status, set, watch, sweep, snap
 tools/focussensor_client.py runs client.py out of a checkout, uninstalled
 config/focussensor.yaml     shipped defaults, and where runtime changes persist
-sd-image/                   the Pi installer
+sd-image/install-focussensor.sh   the Pi installer
+sd-image/usb-gadget.sh      USB ethernet gadget bring-up
+sd-image/wifi-from-boot.sh  optional WiFi from a file on the boot partition
 tests/                      hardware-free test suite
 ```
 

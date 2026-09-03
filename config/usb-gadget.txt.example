@@ -1,0 +1,10 @@
+# Copy to the boot partition as `usb-gadget.txt` to change the USB ethernet
+# protocol the sensor presents. The default (ecm) needs no driver on macOS or
+# Linux and is the right choice unless you know otherwise.
+#
+#   mode=ecm     CDC-ECM   - macOS (any version) and Linux, driverless
+#   mode=ncm     CDC-NCM   - Linux, macOS 13+, Windows 10+; faster
+#   mode=rndis   RNDIS     - Windows without extra drivers; macOS will not bind
+#   mode=eem     CDC-EEM   - Linux only
+
+mode=ecm

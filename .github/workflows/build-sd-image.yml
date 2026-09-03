@@ -104,16 +104,90 @@ jobs:
           sudo chroot /tmp/rpi-root /provision.sh
           sudo rm -f /tmp/rpi-root/provision.sh /tmp/rpi-root/usr/bin/qemu-aarch64-static
 
-      - name: Verify the installed service imports
+      - name: Verify the image will actually boot into a working sensor
         run: |
-          # A broken import here would otherwise only show up on a real Pi.
-          sudo cp /usr/bin/qemu-aarch64-static /tmp/rpi-root/usr/bin/
-          sudo chroot /tmp/rpi-root /opt/focussensor/venv/bin/python -c \
+          set -uo pipefail
+          R=/tmp/rpi-root
+          fail=0
+
+          # A broken import would otherwise only show up on a real Pi.
+          sudo cp /usr/bin/qemu-aarch64-static "$R/usr/bin/"
+          sudo chroot "$R" /opt/focussensor/venv/bin/python -c \
             "from focussensor.server import create_app; \
              from focussensor.config import load_config; \
              app = create_app(load_config('/boot/firmware/focussensor.yaml')); \
-             print('service imports OK:', len(app.routes), 'routes')"
-          sudo rm -f /tmp/rpi-root/usr/bin/qemu-aarch64-static
+             print('service imports OK:', len(app.routes), 'routes')" || fail=1
+          sudo rm -f "$R/usr/bin/qemu-aarch64-static"
+
+          # Enablement is checked as symlinks rather than with `systemctl
+          # is-enabled`, which is unreliable in a chroot with no running
+          # manager. A unit that is installed but never enabled is invisible
+          # until the Pi boots with nothing listening on 8321 -- which is
+          # exactly how this shipped once.
+          for unit in focussensor.service focussensor-wifi.service \
+                      avahi-daemon.service dnsmasq.service; do
+            if sudo test -L "$R/etc/systemd/system/multi-user.target.wants/$unit"; then
+              echo "  enabled: $unit"
+            else
+              echo "  NOT ENABLED: $unit"; fail=1
+            fi
+          done
+          if sudo test -L "$R/etc/systemd/system/sysinit.target.wants/focussensor-usb-gadget.service"; then
+            echo "  enabled: focussensor-usb-gadget.service"
+          else
+            echo "  NOT ENABLED: focussensor-usb-gadget.service"; fail=1
+          fi
+
+          # The first-boot user wizard must be masked, or the Pi stops on the
+          # HDMI console asking for a username and never finishes booting.
+          if [ "$(sudo readlink "$R/etc/systemd/system/userconfig.service" 2>/dev/null)" = /dev/null ]; then
+            echo "  masked: userconfig.service"
+          else
+            echo "  NOT MASKED: userconfig.service"; fail=1
+          fi
+
+          # Waiting for a network that may never be configured looks exactly
+          # like a hang on the console.
+          for unit in NetworkManager-wait-online.service systemd-networkd-wait-online.service; do
+            if [ "$(sudo readlink "$R/etc/systemd/system/$unit" 2>/dev/null)" = /dev/null ]; then
+              echo "  masked: $unit"
+            else
+              echo "  note: $unit not masked (may not exist in this image)"
+            fi
+          done
+
+          # The USB gadget needs dwc2 in both places: the overlay puts the OTG
+          # port in peripheral mode, and modules-load gets the driver up before
+          # userspace. Either one missing means no usb0 and no way in.
+          if sudo grep -qs "^dtoverlay=dwc2" "$R/boot/firmware/config.txt"; then
+            echo "  present: dtoverlay=dwc2"
+          else
+            echo "  MISSING: dtoverlay=dwc2 in config.txt"; fail=1
+          fi
+          if sudo grep -qs "modules-load=dwc2" "$R/boot/firmware/cmdline.txt"; then
+            echo "  present: modules-load=dwc2"
+          else
+            echo "  MISSING: modules-load=dwc2 in cmdline.txt"; fail=1
+          fi
+
+          for path in /usr/local/sbin/focussensor-usb-gadget \
+                      /usr/local/sbin/focussensor-wifi; do
+            if sudo test -x "$R$path"; then
+              echo "  present: $path"
+            else
+              echo "  MISSING: $path"; fail=1
+            fi
+          done
+
+          # DHCP on the link is what gets the host an address; without it the
+          # interface appears and nothing answers.
+          if sudo test -f "$R/etc/dnsmasq.d/focussensor-usb0.conf"; then
+            echo "  present: DHCP for usb0"
+          else
+            echo "  MISSING: /etc/dnsmasq.d/focussensor-usb0.conf"; fail=1
+          fi
+
+          exit $fail
 
       - name: Unmount image
         if: always()

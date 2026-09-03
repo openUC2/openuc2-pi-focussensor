@@ -1,0 +1,16 @@
+[Unit]
+Description=openUC2 focus sensor WiFi from the boot partition
+Documentation=https://github.com/openUC2/openuc2-pi-focussensor
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=focussensor.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/focussensor-wifi
+# Never let a WiFi misconfiguration hold up the rest of the boot.
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

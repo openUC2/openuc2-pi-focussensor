@@ -1,0 +1,17 @@
+[Unit]
+Description=openUC2 focus sensor USB ethernet gadget
+Documentation=https://github.com/openUC2/openuc2-pi-focussensor
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Before=network-pre.target focussensor.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/focussensor-usb-gadget
+# A missing cable must not hold up the boot.
+TimeoutStartSec=30
+
+[Install]
+WantedBy=sysinit.target
