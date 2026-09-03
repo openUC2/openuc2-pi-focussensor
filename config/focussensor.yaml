@@ -1,0 +1,67 @@
+# openUC2 Pi focus sensor — service configuration.
+#
+# On a Pi this file lives at /boot/firmware/focussensor.yaml so you can edit it
+# by putting the SD card in a laptop. Everything here can also be changed live
+# over the REST API; POST /api/params/save writes the running values back here.
+
+name: openuc2-focussensor
+
+server:
+  host: 0.0.0.0
+  port: 8321
+  log_level: info
+
+camera:
+  # auto      -> real Pi camera if picamera2 imports, simulator otherwise
+  # picamera2 -> real camera only; fails loudly rather than faking pixels
+  # simulated -> always the two-spot simulation
+  backend: auto
+  camera_num: 0
+
+  startup:
+    exposure_us: 5000
+    gain: 1.0
+    binning: 1
+    fps_target: 100.0
+    # Window on the sensor, in full-sensor pixels. Keep it a narrow band around
+    # the two spots: this is what makes the sensor fast, not the maths.
+    roi: {x: 408, y: 444, width: 640, height: 200}
+
+  # Only used by the simulated backend.
+  simulation:
+    z_focus_um: 0.0
+    sensitivity_px_per_um: 3.0     # the number a calibration sweep recovers
+    spot_separation_px: 220.0
+    separation_px_per_um: 0.12
+    capture_range_um: 25.0         # beyond this the response saturates
+    sigma_x_px: 5.0
+    sigma_y_px: 7.0
+    sigma_growth_px_per_um: 0.08
+    left_amplitude: 190.0
+    right_relative_amplitude: 0.62
+    background_counts: 6.0
+    read_noise_counts: 2.0
+    stray_light_gradient: 3.0
+    drift_um_per_s: 0.02           # slow thermal drift for the lock to fight
+    jitter_um_rms: 0.01
+    dropout_probability: 0.0       # raise to exercise the invalid-sample path
+
+focus:
+  projection_mode: max             # bright dots on dark ground
+  baseline_percentile: 20.0
+  gaussian_sigma: 3.0              # ~ the spot radius in pixels
+  peak_distance: 40                # minimum spot separation, pixels
+  peak_prominence_mad: 4.0
+  peak_height_mad: 3.0
+  history_length: 5
+  # Peak prominence, in noise-MAD units, below which a sample is marked
+  # invalid. Measured floor: pure sensor noise through this pipeline peaks at
+  # ~6 MAD, a real two-spot frame reaches several hundred - so 10 rejects
+  # noise with margin and never touches a real signal. Without it, a blocked
+  # beam feeds noise-derived positions straight into the PI loop.
+  min_quality: 10.0
+
+stream:
+  history_length: 2000
+  mjpeg_fps: 10.0
+  jpeg_quality: 80

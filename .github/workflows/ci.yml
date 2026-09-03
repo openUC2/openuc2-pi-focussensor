@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the package
+        run: |
+          python -m pip install --upgrade pip
+          # The dev extra adds scipy, which is NOT a runtime dependency — the
+          # sensor ships pure-numpy kernels so a Pi image stays small. It is
+          # here only so the tests can assert they still match SciPy exactly.
+          pip install -e ".[dev]"
+
+      - name: Syntax check
+        run: python -m compileall -q software tools tests main.py
+
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Debug entry point works uninstalled
+        run: python main.py selftest --steps 7
+
+      - name: Shell script check
+        run: |
+          bash -n sd-image/install-focussensor.sh
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Start the sensor service (simulated camera)
+        run: |
+          nohup focussensor \
+            --config config/focussensor.yaml --backend simulated --port 8321 \
+            > /tmp/focussensor.log 2>&1 &
+          for i in $(seq 1 40); do
+            curl -sf http://127.0.0.1:8321/api/health >/dev/null && break
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:8321/api/health || { cat /tmp/focussensor.log; exit 1; }
+
+      - name: Exercise the full wire protocol
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, urllib.request
+          from focussensor.client import FocusSensorClient
+
+          client = FocusSensorClient("127.0.0.1", 8321)
+
+          status = client.status()
+          assert status["running"] and status["simulated"], status
+          assert status["stats"]["errors"] == 0, status["stats"]
+          print("status OK:", status["camera"]["model"], status["stats"]["fps"], "Hz")
+
+          sample = client.focus()
+          assert sample["valid"] and sample["focus"] is not None, sample
+          print("focus OK:", round(sample["focus"], 3), "px  q", round(sample["quality"], 1))
+
+          # Camera controls must actually take effect on the sensor.
+          params = client.camera_params(exposure_us=8000, gain=2.0,
+                                        roi={"x": 300, "y": 400, "width": 800, "height": 240})
+          assert params["exposure_us"] == 8000 and params["gain"] == 2.0, params
+          assert params["frame_shape"] == {"width": 800, "height": 240}, params
+          client.camera_params(roi={"x": 408, "y": 444, "width": 640, "height": 200},
+                               exposure_us=5000, gain=1.0)
+          print("camera params OK")
+
+          focus_params = client.focus_params(gaussian_sigma=3.5, peak_distance=45)
+          assert focus_params["gaussian_sigma"] == 3.5, focus_params
+          client.focus_params(gaussian_sigma=3.0, peak_distance=40)
+          print("focus params OK")
+
+          # Debug image paths.
+          jpeg = client.frame_jpeg()
+          assert jpeg[:2] == b"\xff\xd8", "not a JPEG"
+          raw = urllib.request.urlopen("http://127.0.0.1:8321/api/frame.npy", timeout=5).read()
+          assert raw[:6] == b"\x93NUMPY", "not an npy buffer"
+          print("image endpoints OK:", len(jpeg), "byte jpeg,", len(raw), "byte npy")
+
+          # A z sweep must recover the configured triangulation sensitivity.
+          rows = client.sweep(-8, 8, 17, settle_s=0.03, averages=2)
+          valid = [(z, f) for z, f, _, _ in rows if f is not None]
+          assert len(valid) == len(rows), "sweep produced invalid samples"
+          import statistics
+          xs = [z for z, _ in valid]; ys = [f for _, f in valid]
+          mx, my = statistics.fmean(xs), statistics.fmean(ys)
+          slope = (sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+                   / sum((x - mx) ** 2 for x in xs))
+          expected = 3.0
+          assert abs(slope - expected) < 0.25, f"sensitivity {slope} != {expected}"
+          assert ys == sorted(ys), "focus is not monotonic in z"
+          print(f"sweep OK: {slope:.3f} px/um (model {expected})")
+          PY
+
+      - name: Exercise the websocket
+        run: |
+          python - <<'PY'
+          import asyncio, json, time
+          import websockets
+
+          async def main():
+              async with websockets.connect("ws://127.0.0.1:8321/ws/focus") as socket:
+                  samples, t0 = [], time.monotonic()
+                  while len(samples) < 50:
+                      samples.append(json.loads(await asyncio.wait_for(socket.recv(), 5)))
+                  rate = len(samples) / (time.monotonic() - t0)
+              seqs = [s["seq"] for s in samples]
+              assert seqs == sorted(seqs), "samples arrived out of order"
+              assert all(s["valid"] for s in samples), "invalid samples on the socket"
+              assert rate > 20, f"socket rate too low: {rate:.1f} Hz"
+              print(f"websocket OK: {len(samples)} samples at {rate:.0f} Hz")
+
+          asyncio.run(main())
+          PY
+
+      - name: Server log
+        if: always()
+        run: tail -40 /tmp/focussensor.log

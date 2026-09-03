@@ -33,17 +33,20 @@ brought up and debugged before any optics exist.
 ## Quick start (no hardware)
 
 ```bash
-pip install numpy pillow pyyaml "fastapi>=0.110" "uvicorn[standard]>=0.27" "websockets>=12"
-PYTHONPATH=software python -m focussensor --config config/focussensor.yaml --backend simulated
+uv venv && uv pip install -e ".[dev]"
+.venv/bin/focussensor --backend simulated
 ```
 
 Then, from anywhere:
 
 ```bash
-tools/focussensor_client.py status
-tools/focussensor_client.py watch --seconds 5
-tools/focussensor_client.py sweep --start -10 --stop 10 --steps 21
+focussensor-client status
+focussensor-client watch --seconds 5
+focussensor-client sweep --start -10 --stop 10 --steps 21
 ```
+
+Nothing has to be installed to use the client: `tools/focussensor_client.py`
+runs the same code straight out of a checkout, with only the standard library.
 
 The sweep drives the simulated stage and fits the triangulation sensitivity —
 the same measurement ImSwitch's calibration performs against a real stage:
@@ -56,6 +59,37 @@ linear fit over z in [-6.00, 6.00] um:
 
 Open <http://127.0.0.1:8321/> for the live alignment view: the ROI with the
 detected peaks and the projection drawn on it, plus the running focus value.
+
+## Debugging
+
+`main.py` is the entry point for poking at the repo. It puts `software/` on the
+path itself, so it needs no install, no `PYTHONPATH` and no systemd — set a
+breakpoint anywhere and step through it.
+
+```bash
+python main.py                 # serve, simulated camera, debug logging
+python main.py --backend auto  # serve, real Pi camera if one is present
+python main.py selftest        # headless z sweep, no HTTP at all
+python main.py snap --z 4.0    # one annotated frame to a file
+```
+
+`selftest` is the one to reach for when something is wrong: it builds the
+engine in-process, sweeps the simulated stage and prints focus against z with a
+fitted sensitivity — the whole signal path in one stack, with no server, no
+sockets and no ImSwitch in the way.
+
+```
+   z (um)   focus (px)   sep (px)   quality      ms  valid
+   -8.000      186.941     219.00     169.3    0.72  True
+    0.000      209.937     220.09     131.0    0.74  True
+    8.000      233.384     221.12     121.6    1.21  True
+
+sensitivity over z in [-4.00, 4.00] um: 3.0258 px/um
+rate 88.19 Hz, 0.834 ms/frame, 19 frames, 0 errors
+```
+
+A sensitivity near zero there means the spots are outside the ROI, which is by
+far the most common way to get a sensor that runs happily and measures nothing.
 
 ## Why USB ethernet and not UVC
 
@@ -184,9 +218,11 @@ sudo reboot
 
 The installer is idempotent — run it again after a `git pull` to update.
 
-It installs the service to `/opt/focussensor` with a venv (numpy, Pillow and
-picamera2 come from apt; building them with pip on a Pi is slow at best),
-enables `focussensor.service`, brings up the CDC-NCM USB gadget with a static
+It stages the source in `/opt/focussensor/src` and `pip install`s it into a
+venv built with `--system-site-packages`, so numpy, Pillow and picamera2 come
+from apt (building those with pip on a Pi is slow at best) while the service's
+own dependencies come from `pyproject.toml`. It then enables
+`focussensor.service`, brings up the CDC-NCM USB gadget with a static
 `192.168.7.2` on `usb0`, and sets the hostname to `focussensor.local` so the
 host can reach it by name without configuring an address of its own.
 
@@ -267,6 +303,8 @@ stage.
 ## Repository layout
 
 ```
+main.py                     debug entry point: serve / selftest / snap
+pyproject.toml              package metadata; `focussensor` + `focussensor-client`
 software/focussensor/       the service
   cameras/base.py           camera interface (exposure, gain, ROI, binning, fps)
   cameras/simulated.py      two-spot optical + noise model
@@ -276,7 +314,8 @@ software/focussensor/       the service
   engine.py                 acquisition loop, fan-out, watchdog
   server.py                 REST + WebSocket + MJPEG + debug page
   overlay.py                annotated debug JPEG
-tools/focussensor_client.py standalone client: status, set, watch, sweep, snap
+  client.py                 standalone client: status, set, watch, sweep, snap
+tools/focussensor_client.py runs client.py out of a checkout, uninstalled
 config/focussensor.yaml     shipped defaults
 sd-image/                   installer and USB gadget setup
 tests/                      hardware-free test suite

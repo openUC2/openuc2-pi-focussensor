@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openuc2-focussensor"
+description = "Satellite two-spot reflection focus sensor for openUC2 / ImSwitch"
+readme = "README.md"
+requires-python = ">=3.9"
+dynamic = ["version"]
+authors = [{ name = "openUC2" }]
+keywords = ["microscopy", "focus-lock", "raspberry-pi", "imswitch", "openuc2"]
+
+# Deliberately unpinned on numpy/pillow/pyyaml: on a Pi those come from apt
+# (python3-numpy, python3-pil, python3-yaml) into a --system-site-packages
+# venv, and a pin would make pip rebuild them from source for no reason.
+dependencies = [
+    "numpy",
+    "pillow",
+    "pyyaml",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "websockets>=12",
+]
+
+[project.optional-dependencies]
+# scipy is not a runtime dependency — the sensor ships pure-numpy kernels so a
+# Pi image stays small. It is here only so the tests can assert those kernels
+# still match SciPy exactly.
+dev = ["pytest>=7", "scipy", "httpx"]
+
+[project.scripts]
+focussensor = "focussensor.__main__:main"
+focussensor-client = "focussensor.client:main"
+
+[project.urls]
+Homepage = "https://github.com/openUC2/openuc2-pi-focussensor"
+
+[tool.setuptools]
+package-dir = { "" = "software" }
+
+[tool.setuptools.dynamic]
+version = { attr = "focussensor.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["software"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Local overrides and captured debug output
+focussensor.local.yaml
+*.jpg
+*.png
+*.csv

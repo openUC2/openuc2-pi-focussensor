@@ -1,0 +1,180 @@
+name: Build focus sensor SD card image
+
+# Produces a ready-to-flash Raspberry Pi OS image: downloads the official
+# Bookworm Lite image, chroots into it with qemu and runs
+# sd-image/install-focussensor.sh — the same script you can run on a live Pi.
+#
+# arm64, not armhf: the sensor targets the Pi Zero 2 W (quad Cortex-A53).
+# The original Pi Zero's single ARMv6 core is not a sensible host for
+# libcamera plus a per-frame estimator, so 32-bit is not built.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/use (e.g. v1.2.3). Empty = auto tag."
+        required: false
+      prerelease:
+        description: "Mark release as prerelease"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  BASE_IMAGE_URL: https://downloads.raspberrypi.org/raspios_lite_arm64/images/raspios_lite_arm64-2025-05-13/2025-05-13-raspios-bookworm-arm64-lite.img.xz
+  IMAGE_NAME_BASE: openuc2-focussensor-sdcard
+  PI_USER: pi
+  PI_PASSWORD: youseetoo
+
+jobs:
+  build-sd-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support parted kpartx \
+                                  xz-utils wget
+
+      - name: Download Raspberry Pi OS Lite (Bookworm, arm64)
+        run: |
+          wget -q -O rpi-os.img.xz "$BASE_IMAGE_URL"
+          xz -d rpi-os.img.xz
+
+      - name: Expand image
+        run: |
+          # Room for the venv (fastapi/uvicorn/websockets) plus picamera2.
+          dd if=/dev/zero bs=1M count=2048 >> rpi-os.img
+          LOOP=$(sudo losetup -fP --show rpi-os.img)
+          echo "LOOP=$LOOP" >> "$GITHUB_ENV"
+          sudo parted "$LOOP" resizepart 2 100%
+          sudo e2fsck -f -y "${LOOP}p2" || true
+          sudo resize2fs "${LOOP}p2"
+
+      - name: Mount image
+        run: |
+          mkdir -p /tmp/rpi-root
+          sudo mount "${LOOP}p2" /tmp/rpi-root
+          sudo mount "${LOOP}p1" /tmp/rpi-root/boot/firmware
+          sudo cp /usr/bin/qemu-aarch64-static /tmp/rpi-root/usr/bin/
+          sudo mount -t proc proc /tmp/rpi-root/proc
+          sudo mount -t sysfs sysfs /tmp/rpi-root/sys
+          sudo mount --bind /dev /tmp/rpi-root/dev
+          sudo mount --bind /dev/pts /tmp/rpi-root/dev/pts
+          sudo rm -f /tmp/rpi-root/etc/resolv.conf
+          echo "nameserver 1.1.1.1" | sudo tee /tmp/rpi-root/etc/resolv.conf
+          # Copy the repo in for the installer (removed again afterwards).
+          sudo mkdir -p /tmp/rpi-root/opt/focussensor-src
+          sudo cp -r software config sd-image tools pyproject.toml README.md \
+                     /tmp/rpi-root/opt/focussensor-src/
+
+      - name: Install the focus sensor in chroot
+        run: |
+          cat <<CHROOT | sudo tee /tmp/rpi-root/provision.sh >/dev/null
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Default user (an image-build concern, not part of the installer).
+          if ! id "$PI_USER" >/dev/null 2>&1; then
+            useradd -m -s /bin/bash -G sudo,video,render,gpio,i2c,spi,dialout,adm "$PI_USER"
+          fi
+          echo "$PI_USER:$PI_PASSWORD" | chpasswd
+
+          bash /opt/focussensor-src/sd-image/install-focussensor.sh
+
+          touch /boot/firmware/ssh
+          rm -rf /opt/focussensor-src
+          apt-get clean
+          CHROOT
+          sudo chmod +x /tmp/rpi-root/provision.sh
+          sudo chroot /tmp/rpi-root /provision.sh
+          sudo rm -f /tmp/rpi-root/provision.sh /tmp/rpi-root/usr/bin/qemu-aarch64-static
+
+      - name: Verify the installed service imports
+        run: |
+          # A broken import here would otherwise only show up on a real Pi.
+          sudo cp /usr/bin/qemu-aarch64-static /tmp/rpi-root/usr/bin/
+          sudo chroot /tmp/rpi-root /opt/focussensor/venv/bin/python -c \
+            "from focussensor.server import create_app; \
+             from focussensor.config import load_config; \
+             app = create_app(load_config('/boot/firmware/focussensor.yaml')); \
+             print('service imports OK:', len(app.routes), 'routes')"
+          sudo rm -f /tmp/rpi-root/usr/bin/qemu-aarch64-static
+
+      - name: Unmount image
+        if: always()
+        run: |
+          sudo sync
+          sudo umount /tmp/rpi-root/dev/pts || true
+          sudo umount /tmp/rpi-root/dev || true
+          sudo umount /tmp/rpi-root/sys || true
+          sudo umount /tmp/rpi-root/proc || true
+          sudo umount /tmp/rpi-root/boot/firmware || true
+          sudo umount /tmp/rpi-root || true
+          sudo losetup -d "$LOOP" || true
+
+      - name: Compress image
+        run: |
+          NAME="${IMAGE_NAME_BASE}-$(date +%Y%m%d).img"
+          mv rpi-os.img "$NAME"
+          xz -T0 -6 "$NAME"
+          ls -lh "${NAME}.xz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: focussensor-sd-image
+          path: openuc2-focussensor-sdcard-*.img.xz
+          retention-days: 30
+
+      - name: Compute release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="v$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.tag.outputs.tag }}
+          name: openUC2 Pi focus sensor ${{ steps.tag.outputs.tag }}
+          body: |
+            openUC2 Pi focus sensor SD card image (Raspberry Pi Zero 2 W, arm64).
+
+            Flash the `.img.xz` with Raspberry Pi Imager or `dd`, insert the card,
+            and plug the Pi's **OTG** USB port into the microscope host — one cable
+            carries power and the data link.
+
+            The sensor then appears at `http://focussensor.local:8321/` (or
+            `http://192.168.7.2:8321/`). It boots with the **simulated** two-spot
+            camera unless a real Pi camera is detected, so the whole ImSwitch focus
+            lock can be exercised before any optics exist.
+
+            Config lives at `/boot/firmware/focussensor.yaml` — editable with the
+            card in a laptop.
+          prerelease: ${{ github.event.inputs.prerelease || false }}
+          allowUpdates: true
+          artifacts: "openuc2-focussensor-sdcard-*.img.xz"
+          artifactContentType: application/x-xz
+          token: ${{ secrets.GITHUB_TOKEN }}

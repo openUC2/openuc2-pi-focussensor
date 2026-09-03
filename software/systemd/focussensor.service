@@ -1,0 +1,27 @@
+[Unit]
+Description=openUC2 Pi focus sensor
+Documentation=https://github.com/openUC2/openuc2-pi-focussensor
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/focussensor
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/focussensor/venv/bin/focussensor
+Restart=always
+RestartSec=3
+
+# A focus sensor that falls behind is a focus sensor that is not doing its job:
+# give the acquisition loop scheduling priority over everything else on the Pi.
+Nice=-10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
+# The service reads its config from the boot partition and writes nothing else.
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
